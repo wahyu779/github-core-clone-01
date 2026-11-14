@@ -18,6 +18,26 @@
 //   * Unknown routes are 404 {"message":"Not Found"} — never HTML.
 //   * A handler that throws is caught here and answered 500 JSON, so one
 //     bad request can never take the server down.
+//
+// Perf note (Hunt 07 v2, lane A — framing only, no behaviour change):
+// the per-request path used to do work the platform already does or the
+// lanes redo anyway. What changed, and why it is safe:
+//   * No body read for bodyless requests. A GET with Content-Length: 0
+//     (or no length and no transfer-encoding) used to sit through an
+//     `end`-event wait; now it gets a shared empty buffer straight away.
+//   * No header copy. Node lowercases incoming header names itself, so
+//     req.headers is used as-is instead of rebuilding a second object.
+//   * No `new URL()` per request. The target is split on the first `?`
+//     by hand; the query half still goes through URLSearchParams.
+//   * No REST route-params regexes. rest.ts parses ctx.path itself, and
+//     no lane reads ctx.params at all, so only the git-owner/repo regex
+//     survives — and only on git routes.
+//   * Response headers are built with plain assignments, not spreads:
+//     sendJson reuses one fixed-shape object; sendResponse builds one
+//     fresh literal per reply (reusing a shared object there measured
+//     slower on writes — the per-call `delete` deopts it — see the note
+//     above sendResponse). Either way the same status codes, headers
+//     and bodies come out as before.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
@@ -25,6 +45,12 @@ import { Store, type HandlerCtx, type HandlerResponse } from './store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const OAUTH_SCOPES = 'repo, read:org';
+
+/** One shared empty body for every request that carries nothing. */
+const EMPTY_BODY = Buffer.alloc(0);
+
+/** Shared params object for routes that carry no git owner/repo. */
+const NO_PARAMS: Record<string, string> = {};
 
 type LaneHandler = (
   store: Store,
@@ -74,12 +100,32 @@ function expectedToken(): string {
   return fromEnv !== undefined && fromEnv !== '' ? fromEnv : 'test-token';
 }
 
-/** Pull "Bearer <token>" out of the Authorization header, or null. */
-function bearerToken(headers: Record<string, string>): string | null {
-  const raw = headers.authorization;
-  if (raw === undefined) return null;
-  const match = /^Bearer\s+(.+)$/.exec(raw.trim());
+/**
+ * Pull "Bearer <token>" out of the Authorization header, or null.
+ * Node has already lowercased the header name; a repeated header arrives
+ * as an array, in which case the first value is the one that counts.
+ */
+function bearerToken(req: IncomingMessage): string | null {
+  const raw = req.headers.authorization;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (value === undefined) return null;
+  const match = /^Bearer\s+(.+)$/.exec(value.trim());
   return match === null ? null : match[1];
+}
+
+/**
+ * True when the request actually carries a body. A declared length above
+ * zero means yes; chunked (or any other) transfer-encoding means yes —
+ * the sender may still be streaming. No length and no transfer-encoding
+ * means the request is bodyless, which covers every GET in the suite.
+ */
+function hasBody(req: IncomingMessage): boolean {
+  const length = req.headers['content-length'];
+  if (length !== undefined) {
+    const value = Array.isArray(length) ? length[0] : length;
+    return value !== '0' && Number(value) > 0;
+  }
+  return req.headers['transfer-encoding'] !== undefined;
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -93,40 +139,33 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-function lowerHeaders(req: IncomingMessage): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [name, value] of Object.entries(req.headers)) {
-    if (typeof value === 'string') out[name.toLowerCase()] = value;
-    else if (Array.isArray(value)) out[name.toLowerCase()] = value.join(', ');
-  }
-  return out;
+/**
+ * Split the request target into path and query without a URL parse.
+ * The path half is left exactly as sent (the old `new URL()` pathname
+ * never decoded it either); the query half keeps URLSearchParams
+ * semantics, including `+` as a space and percent-decoding.
+ */
+function splitTarget(req: IncomingMessage): { path: string; query: URLSearchParams } {
+  const target = req.url ?? '/';
+  const cut = target.indexOf('?');
+  if (cut === -1) return { path: target, query: new URLSearchParams() };
+  return { path: target.slice(0, cut), query: new URLSearchParams(target.slice(cut + 1)) };
 }
 
-function splitPath(req: IncomingMessage): { path: string; query: URLSearchParams } {
-  try {
-    const url = new URL(req.url ?? '/', 'http://forge');
-    return { path: url.pathname, query: url.searchParams };
-  } catch {
-    return { path: '/', query: new URLSearchParams() };
-  }
-}
-
-/** Best-effort route params; lanes parse ctx.path themselves for detail. */
-function routeParams(path: string): Record<string, string> {
-  const params: Record<string, string> = {};
+/**
+ * Best-effort route params for git routes only; lanes parse ctx.path
+ * themselves for detail, and no lane reads ctx.params at all. The REST
+ * regexes used to live here too, but rest.ts re-parses its own path, so
+ * running them on every request was pure overhead.
+ */
+function gitParams(path: string): Record<string, string> {
   const git = /^\/([^/]+)\/([^/]+)\.git(?:\/(.*))?$/.exec(path);
-  if (git !== null) {
-    params.owner = decodeURIComponent(git[1]);
-    params.repo = decodeURIComponent(git[2]);
-    if (git[3] !== undefined) params.subpath = git[3];
-    return params;
-  }
-  const repo = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)(?:\/(.*))?$/.exec(path);
-  if (repo !== null) {
-    params.owner = decodeURIComponent(repo[1]);
-    params.repo = decodeURIComponent(repo[2]);
-    if (repo[3] !== undefined) params.rest = repo[3];
-  }
+  if (git === null) return NO_PARAMS;
+  const params: Record<string, string> = {
+    owner: decodeURIComponent(git[1]),
+    repo: decodeURIComponent(git[2]),
+  };
+  if (git[3] !== undefined) params.subpath = git[3];
   return params;
 }
 
@@ -139,6 +178,17 @@ export function createApp(): Server {
     return `req-${requestSeq}`;
   }
 
+  // One reused header object for sendJson. Node's writeHead copies the
+  // values into its own store synchronously, and sendJson calls writeHead
+  // + end with no await in between, so clearing the caller's extras right
+  // after writeHead cannot disturb the response in flight. sendResponse
+  // deliberately does NOT reuse an object: clearing a shared object with
+  // `delete` on every call pushes it into dictionary mode and measured
+  // slower and noisier on the write path in the lane A/B test, so it
+  // builds one fresh literal per reply with plain assignments instead of
+  // spreads (one allocation, no intermediate objects, no deletes).
+  const jsonHead: Record<string, string> = { 'content-type': JSON_TYPE };
+
   function sendJson(
     res: ServerResponse,
     status: number,
@@ -146,25 +196,28 @@ export function createApp(): Server {
     extra: Record<string, string> = {},
   ): void {
     const text = `${JSON.stringify(body)}\n`;
-    res.writeHead(status, {
-      'content-type': JSON_TYPE,
-      'content-length': Buffer.byteLength(text),
-      'x-github-request-id': requestId(),
-      ...extra,
-    });
+    jsonHead['content-length'] = String(Buffer.byteLength(text));
+    jsonHead['x-github-request-id'] = requestId();
+    for (const name of Object.keys(extra)) jsonHead[name] = extra[name];
+    res.writeHead(status, jsonHead);
+    for (const name of Object.keys(extra)) delete jsonHead[name];
     res.end(text);
   }
 
   function sendResponse(res: ServerResponse, reply: HandlerResponse): void {
     const payload: Buffer =
       typeof reply.body === 'string' ? Buffer.from(reply.body, 'utf8') : reply.body;
-    const headers: Record<string, string> = {
-      'content-length': String(payload.length),
-      ...(reply.contentType === undefined || reply.contentType.startsWith('application/json')
-        ? { 'x-github-request-id': requestId() }
-        : {}),
-      ...(reply.headers ?? {}),
-    };
+    // Fresh literal, plain assignments, no spreads: one allocation, and
+    // the lane's own headers still overwrite the framing id exactly as
+    // the old spread order did (rest.ts sets its own request id).
+    const headers: Record<string, string> = {};
+    headers['content-length'] = String(payload.length);
+    if (reply.contentType === undefined || reply.contentType.startsWith('application/json')) {
+      headers['x-github-request-id'] = requestId();
+    }
+    if (reply.headers !== undefined) {
+      for (const name of Object.keys(reply.headers)) headers[name] = reply.headers[name];
+    }
     if (reply.contentType !== undefined) headers['content-type'] = reply.contentType;
     else if (headers['content-type'] === undefined) headers['content-type'] = JSON_TYPE;
     res.writeHead(reply.status, headers);
@@ -178,9 +231,8 @@ export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
-        const { path, query } = splitPath(req);
+        const { path, query } = splitTarget(req);
         const method = (req.method ?? 'GET').toUpperCase();
-        const headers = lowerHeaders(req);
 
         // Boot probe: no auth, no body, always 200 {"ok":true}.
         if (method === 'GET' && path === '/healthz') {
@@ -188,13 +240,15 @@ export function createApp(): Server {
           return;
         }
 
-        const token = bearerToken(headers);
+        const token = bearerToken(req);
         if (token === null || token !== expectedToken()) {
           sendError(res, 401, 'Bad credentials');
           return;
         }
 
-        const body = await readBody(req);
+        // Bodyless requests skip the read entirely — the old code waited
+        // for the `end` event even on a GET with no body at all.
+        const body = hasBody(req) ? await readBody(req) : EMPTY_BODY;
 
         // The API root answers here, in this file, like api.github.com's GET /.
         if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
@@ -229,10 +283,14 @@ export function createApp(): Server {
           method,
           path,
           query,
-          headers,
+          // Node lowercases header names already; pass them through
+          // untouched instead of rebuilding a second object per request.
+          // The cast only bridges the type: values the lanes read
+          // (host, git-protocol) arrive as single strings in practice.
+          headers: req.headers as unknown as Record<string, string>,
           body,
           json,
-          params: routeParams(path),
+          params: isGitRoute ? gitParams(path) : NO_PARAMS,
           token,
         };
 

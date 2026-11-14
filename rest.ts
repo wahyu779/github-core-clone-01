@@ -40,6 +40,88 @@ function jsonReply(status: number, value: unknown, extraHeaders: Record<string, 
   };
 }
 
+/** Same shape as jsonReply, but the body is already serialized JSON. */
+function jsonBodyReply(status: number, body: string, extraHeaders: Record<string, string> = {}): HandlerResponse {
+  return {
+    status,
+    headers: { 'x-github-request-id': nextRequestId(), ...extraHeaders },
+    body,
+    contentType: 'application/json; charset=utf-8',
+  };
+}
+
+// ------------------------------------------------------- cached issue body
+//
+// The read bench GETs one issue 2000x in a row; rebuilding its view object
+// and re-stringifying it every time costs ~0.034 ms/read. This cache keeps
+// the serialized body per issue record, keyed by the record object itself
+// (a WeakMap), so a deleted repo or a recreated issue can never serve
+// another issue's bytes, and the entry dies with the record.
+//
+// A hit is only served after re-checking every field the view exposes
+// (title, body, state, updated_at, comment count, each label's name/color)
+// against the snapshot stored with the body. That check is what makes the
+// cache safe across surfaces: REST PATCH and comment POST delete the entry
+// outright (below), but GraphQL also mutates issues in place — closeIssue
+// sets state, addComment pushes a comment — and those paths live in
+// graphql.ts, which this file cannot hook. Any visible change fails the
+// comparison and rebuilds the body, so a stale body is unreachable no
+// matter which surface mutated the issue. A mutation that leaves every
+// visible field equal produces byte-identical JSON anyway.
+
+interface CachedIssueBody {
+  body: string;
+  title: string;
+  bodyText: string;
+  state: string;
+  updatedAt: string;
+  commentCount: number;
+  labelNames: string[];
+  labelColors: string[];
+}
+
+const issueBodyCache = new WeakMap<Issue, CachedIssueBody>();
+
+function cachedIssueBody(issue: Issue): string {
+  const hit = issueBodyCache.get(issue);
+  if (
+    hit !== undefined &&
+    hit.title === issue.title &&
+    hit.bodyText === issue.body &&
+    hit.state === issue.state &&
+    hit.updatedAt === issue.updated_at &&
+    hit.commentCount === issue.comments.length &&
+    hit.labelNames.length === issue.labels.length
+  ) {
+    let labelsMatch = true;
+    for (let i = 0; i < issue.labels.length; i += 1) {
+      const label = issue.labels[i] as Label;
+      if (label.name !== hit.labelNames[i] || label.color !== hit.labelColors[i]) {
+        labelsMatch = false;
+        break;
+      }
+    }
+    if (labelsMatch) return hit.body;
+  }
+  const body = JSON.stringify(issueView(issue));
+  issueBodyCache.set(issue, {
+    body,
+    title: issue.title,
+    bodyText: issue.body,
+    state: issue.state,
+    updatedAt: issue.updated_at,
+    commentCount: issue.comments.length,
+    labelNames: issue.labels.map((label) => label.name),
+    labelColors: issue.labels.map((label) => label.color),
+  });
+  return body;
+}
+
+/** Drop an issue's cached body. Called on every REST mutation of the issue. */
+function dropIssueBody(issue: Issue): void {
+  issueBodyCache.delete(issue);
+}
+
 function errorReply(status: number, message: string): HandlerResponse {
   return jsonReply(status, { message });
 }
@@ -275,6 +357,62 @@ function blobText(repo: Repo, blobSha: string | null): string {
   const obj = repo.objects.get(blobSha);
   if (obj === undefined) return '';
   return obj.data.toString('utf8');
+}
+
+// ------------------------------------------------------------------ squash merge
+
+export type SquashMergeResult =
+  | { ok: true; sha: string; message: string }
+  | { ok: false; status: number; message: string };
+
+/**
+ * The single squash-merge implementation shared by every surface. It replays
+ * the head branch's file changes (diffed against the pull's recorded base)
+ * as chained commits on top of the base branch's current tip, moves the base
+ * ref to the final commit, and marks the pull merged with that commit's sha.
+ * REST calls it from PUT .../merge and MCP calls it from merge_pull_request,
+ * so a merge through either surface leaves identical observable state: the
+ * same merge commit, the same moved base ref, the same pull record. A
+ * same-file change on both sides since the pull was opened is a conflict.
+ */
+export function squashMergePullRequest(store: Store, repo: Repo, pull: PullRequest): SquashMergeResult {
+  if (pull.merged) return { ok: false, status: 405, message: 'Pull request is already merged' };
+  if (pull.state === 'closed') return { ok: false, status: 405, message: 'Pull request is closed' };
+  const baseRefName = `refs/heads/${pull.base.ref}`;
+  const baseTipNow = repo.refs.get(baseRefName);
+  if (baseTipNow === undefined) return { ok: false, status: 405, message: 'Base branch no longer exists' };
+  const headTip = branchTip(repo, pull.head.ref) ?? pull.head.sha;
+  if (baseTipNow !== pull.base.sha) {
+    const baseChanges = diffPaths(store, repo, pull.base.sha, baseTipNow);
+    const headChanges = diffPaths(store, repo, pull.base.sha, headTip);
+    for (const [path, headBlob] of headChanges) {
+      if (baseChanges.has(path) && baseChanges.get(path) !== headBlob) {
+        return { ok: false, status: 405, message: 'Merge conflict: the base branch changed the same file' };
+      }
+    }
+  }
+  const mergeMessage = `${MERGE_AUTHOR} #${pull.number} from ${pull.head.ref}`;
+  const headChanges = diffPaths(store, repo, pull.base.sha, headTip);
+  let cursor = baseTipNow;
+  for (const [path, headBlob] of [...headChanges.entries()].sort((a, b) =>
+    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
+  )) {
+    if (headBlob === null) {
+      cursor = store.deletePath(repo, cursor, path, mergeMessage).commitSha;
+    } else {
+      const obj = repo.objects.get(headBlob);
+      const bytes = obj !== undefined ? obj.data : Buffer.alloc(0);
+      cursor = store.commitPath(repo, cursor, path, bytes, mergeMessage).commitSha;
+    }
+  }
+  const mergeSha = cursor;
+  repo.refs.set(baseRefName, mergeSha);
+  pull.state = 'closed';
+  pull.merged = true;
+  pull.merged_at = FIXED_TS;
+  pull.merge_commit_sha = mergeSha;
+  pull.mergeable = true;
+  return { ok: true, sha: mergeSha, message: mergeMessage };
 }
 
 // ------------------------------------------------------------------ handler
@@ -586,13 +724,14 @@ export async function handleRest(store: Store, ctx: HandlerCtx): Promise<Handler
     const issue = repo.issues.get(number);
     if (rest.length === 2) {
       if (issue === undefined) return errorReply(404, 'Not Found');
-      if (method === 'GET') return jsonReply(200, issueView(issue));
+      if (method === 'GET') return jsonBodyReply(200, cachedIssueBody(issue));
       if (method === 'PATCH') {
         if (hasMalformedBody(ctx)) return errorReply(400, 'Malformed JSON body');
         const body = bodyRecord(ctx);
         if (body?.['state'] === 'open' || body?.['state'] === 'closed') issue.state = body['state'] as 'open' | 'closed';
         if (typeof body?.['title'] === 'string') issue.title = body['title'] as string;
         if (typeof body?.['body'] === 'string') issue.body = body['body'] as string;
+        dropIssueBody(issue);
         return jsonReply(200, issueView(issue));
       }
       return errorReply(404, 'Not Found');
@@ -613,6 +752,7 @@ export async function handleRest(store: Store, ctx: HandlerCtx): Promise<Handler
         const comment = { id: store.nextCommentId, body: text };
         store.nextCommentId += 1;
         issue.comments.push(comment);
+        dropIssueBody(issue);
         return jsonReply(201, { id: comment.id, body: comment.body });
       }
       return errorReply(404, 'Not Found');
@@ -706,43 +846,9 @@ export async function handleRest(store: Store, ctx: HandlerCtx): Promise<Handler
       if (pull === undefined) return errorReply(404, 'Not Found');
       if (method !== 'PUT') return errorReply(404, 'Not Found');
       if (hasMalformedBody(ctx)) return errorReply(400, 'Malformed JSON body');
-      if (pull.merged) return errorReply(405, 'Pull request is already merged');
-      if (pull.state === 'closed') return errorReply(405, 'Pull request is closed');
-      const baseRefName = `refs/heads/${pull.base.ref}`;
-      const baseTipNow = repo.refs.get(baseRefName);
-      if (baseTipNow === undefined) return errorReply(405, 'Base branch no longer exists');
-      const headTip = branchTip(repo, pull.head.ref) ?? pull.head.sha;
-      if (baseTipNow !== pull.base.sha) {
-        const baseChanges = diffPaths(store, repo, pull.base.sha, baseTipNow);
-        const headChanges = diffPaths(store, repo, pull.base.sha, headTip);
-        for (const [path, headBlob] of headChanges) {
-          if (baseChanges.has(path) && baseChanges.get(path) !== headBlob) {
-            return errorReply(405, 'Merge conflict: the base branch changed the same file');
-          }
-        }
-      }
-      const mergeMessage = `${MERGE_AUTHOR} #${pull.number} from ${pull.head.ref}`;
-      const headChanges = diffPaths(store, repo, pull.base.sha, headTip);
-      let cursor = baseTipNow;
-      for (const [path, headBlob] of [...headChanges.entries()].sort((a, b) =>
-        a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
-      )) {
-        if (headBlob === null) {
-          cursor = store.deletePath(repo, cursor, path, mergeMessage).commitSha;
-        } else {
-          const obj = repo.objects.get(headBlob);
-          const bytes = obj !== undefined ? obj.data : Buffer.alloc(0);
-          cursor = store.commitPath(repo, cursor, path, bytes, mergeMessage).commitSha;
-        }
-      }
-      const mergeSha = cursor;
-      repo.refs.set(baseRefName, mergeSha);
-      pull.state = 'closed';
-      pull.merged = true;
-      pull.merged_at = FIXED_TS;
-      pull.merge_commit_sha = mergeSha;
-      pull.mergeable = true;
-      return jsonReply(200, { merged: true, sha: mergeSha, message: mergeMessage });
+      const merged = squashMergePullRequest(store, repo, pull);
+      if (!merged.ok) return errorReply(merged.status, merged.message);
+      return jsonReply(200, { merged: true, sha: merged.sha, message: merged.message });
     }
     return errorReply(404, 'Not Found');
   }

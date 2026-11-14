@@ -17,6 +17,7 @@
 
 import type { HandlerCtx, HandlerResponse, Issue, PullRequest, Repo, Store } from './store.ts';
 import { FIXED_TS } from './store.ts';
+import { squashMergePullRequest } from './rest.ts';
 
 const SERVER_NAME = 'github-core-clone';
 const SERVER_VERSION = '1.0.0';
@@ -500,13 +501,13 @@ const TOOLS: readonly ToolDef[] = [
       const pull = repo.pulls.get(number);
       if (pull === undefined) return toolFail(`Pull request not found: #${number}`);
       if (!pull.merged) {
-        // The merge lands the head tip as the merged result; the base ref is
-        // left where it was (no synthetic merge commit is minted — the suite
-        // only asserts merged === true on the pull request itself).
-        pull.merged = true;
-        pull.state = 'closed';
-        pull.merged_at = FIXED_TS;
-        pull.merge_commit_sha = pull.head.sha;
+        // Same squash merge REST performs: replay the head's changes onto the
+        // base tip, move the base ref to the resulting merge commit, and
+        // record that commit on the pull. (Previously this just stamped the
+        // head tip sha onto the pull and left the base ref unmoved, so the
+        // merged files never actually landed on the base branch.)
+        const merged = squashMergePullRequest(store, repo, pull);
+        if (!merged.ok) return toolFail(merged.message);
       }
       return toolOk(pullView(pull));
     },

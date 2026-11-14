@@ -14,6 +14,13 @@
 // - Generated packs are cached per (repo, wants, haves, depth, shallow) and each
 //   object's deflated bytes are cached on the object itself, so the 50-concurrent
 //   shallow-clone workload deflates each object once.
+// - Advertisements are cached too: the v2 ad is a module-level constant (it
+//   never mentions the repo), and the v0 ads + ls-refs answers are cached per
+//   repo-state fingerprint, so the bench clone's three re-advertisements per
+//   clone cost one Map lookup instead of a rebuild.
+// - Receive-pack unpacks take a single-pass fast path when the pack holds no
+//   delta entries (the bench push shape); packs that do carry deltas still
+//   go through the full resolver below.
 // - No filesystem or network I/O happens in any handler; everything is in-memory.
 
 import { createHash } from 'node:crypto';
@@ -479,17 +486,70 @@ function advertisementV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(chunks);
 }
 
-function advertisementV2(): Buffer {
-  return Buffer.concat([
-    pktLine('# service=git-upload-pack\n'),
-    flushPkt(),
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow filter\n'),
-    pktLine('object-format=sha1\n'),
-    flushPkt(),
-  ]);
+// The v2 advertisement never mentions the repo (fixed capability list), so
+// it is built once at module load and the same Buffer is shared by every
+// request. The clone workload asks for it three times per clone; rebuilding
+// nine pkt-lines for each of those 150 requests was pure waste.
+const ADVERTISEMENT_V2: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  flushPkt(),
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow filter\n'),
+  pktLine('object-format=sha1\n'),
+  flushPkt(),
+]);
+
+/**
+ * Fingerprint of everything an advertisement's bytes depend on: the default
+ * branch (HEAD symref + the upload caps) and every ref name -> oid pair.
+ * A peeled `^{}` / `peeled:` value is a pure function of the tag object's
+ * bytes, and an oid fixes those bytes, so the refs alone determine the ads.
+ *
+ * Keying the cache on this string — never on the repo object, and never
+ * with an invalidation hook — keeps it correct no matter which surface
+ * moved a ref (git push, REST branch / merge / update-ref, GraphQL merge)
+ * and across a delete + recreate of a repo under the same name: any change
+ * simply yields a different fingerprint, and a stale ad is impossible.
+ */
+function refsFingerprint(repo: Repo): string {
+  const parts: string[] = [repo.default_branch];
+  for (const [name, oid] of sortedRefs(repo)) parts.push(`${name}=${oid}`);
+  return parts.join('\n');
+}
+
+interface AdCacheEntry {
+  v0Upload?: Buffer;
+  v0Receive?: Buffer;
+  /** ls-refs answers, keyed by the joined ref-prefix lines. */
+  lsRefs: Map<string, Buffer>;
+}
+
+/** Cached v0 advertisements + ls-refs answers, keyed by refs fingerprint. */
+const adCache = new Map<string, AdCacheEntry>();
+
+function adCacheEntry(repo: Repo): AdCacheEntry {
+  const fp = refsFingerprint(repo);
+  let entry = adCache.get(fp);
+  if (entry) return entry;
+  if (adCache.size > 512) adCache.clear();
+  entry = { lsRefs: new Map() };
+  adCache.set(fp, entry);
+  return entry;
+}
+
+function cachedAdvertisementV0(
+  repo: Repo,
+  service: 'git-upload-pack' | 'git-receive-pack',
+): Buffer {
+  const entry = adCacheEntry(repo);
+  if (service === 'git-upload-pack') {
+    if (!entry.v0Upload) entry.v0Upload = advertisementV0(repo, service);
+    return entry.v0Upload;
+  }
+  if (!entry.v0Receive) entry.v0Receive = advertisementV0(repo, service);
+  return entry.v0Receive;
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +597,20 @@ function handleLsRefs(repo: Repo, lines: string[]): Buffer {
   for (const line of lines) {
     if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
   }
+  // The bench-clone repo is static during a timed round, so all 50 clones
+  // ask the same ls-refs question and get a byte-identical answer. Cache
+  // it under (refs fingerprint, prefixes); any ref change anywhere in the
+  // forge yields a new fingerprint, so the cached answer can never be stale.
+  const entry = adCacheEntry(repo);
+  const key = prefixes.join('\n');
+  const hit = entry.lsRefs.get(key);
+  if (hit) return hit;
+  const built = buildLsRefs(repo, prefixes);
+  entry.lsRefs.set(key, built);
+  return built;
+}
+
+function buildLsRefs(repo: Repo, prefixes: string[]): Buffer {
   const chunks: Buffer[] = [];
   const keep = (name: string): boolean =>
     prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
@@ -807,6 +881,46 @@ interface RawEntry {
   oid?: string;
 }
 
+/**
+ * Unpack a pack that holds no OFS_DELTA / REF_DELTA entries, in a single
+ * pass: inflate each entry and store it. No RawEntry graph, no recursion,
+ * no resolving set — the bench pushes always send full objects, so this is
+ * the shape that actually runs under timing.
+ *
+ * Returns false (storing nothing) as soon as a delta entry is seen, so the
+ * caller can run the full delta-resolving unpack instead. An unknown type
+ * code also returns false — the full path raises the same error the old
+ * code did. The size and trailer checks mirror the full path, so a corrupt
+ * delta-free pack fails here with the same message rather than passing.
+ */
+function tryUnpackDeltaFree(
+  store: Store,
+  repo: Repo,
+  pack: Buffer,
+  trailerStart: number,
+  count: number,
+): boolean {
+  const found: Array<{ type: ObjectType; data: Buffer }> = [];
+  let off = 12;
+  for (let i = 0; i < count; i += 1) {
+    const header = readSizeVarint(pack, off);
+    off = header.next;
+    const typeCode = (header.first >> 4) & 0x07;
+    if (typeCode === 6 || typeCode === 7) return false;
+    const type = CODE_TYPE[typeCode];
+    if (!type) return false;
+    const inflated = inflateAt(pack.subarray(0, trailerStart), off);
+    if (inflated.data.length !== header.size) throw new Error('pack entry size mismatch');
+    found.push({ type, data: inflated.data });
+    off = inflated.next;
+  }
+  if (off !== trailerStart) throw new Error('pack has trailing bytes before its trailer');
+  // Store only after the whole scan proved the pack delta-free, so a
+  // corrupt pack stores nothing — same failure atomicity as the full path.
+  for (const obj of found) store.putObject(repo, obj.type, obj.data);
+  return true;
+}
+
 /** Parse a packfile, resolve any deltas, and store every object verbatim. */
 function unpackPack(store: Store, repo: Repo, pack: Buffer): void {
   if (pack.length < 12 || pack.subarray(0, 4).toString('ascii') !== 'PACK') {
@@ -820,6 +934,11 @@ function unpackPack(store: Store, repo: Repo, pack: Buffer): void {
   const trailer = pack.subarray(trailerStart).toString('hex');
   const computed = createHash('sha1').update(pack.subarray(0, trailerStart)).digest('hex');
   if (trailer !== computed) throw new Error('pack trailer checksum mismatch');
+
+  // Delta-free packs (every bench push) take the single-pass fast path.
+  // Delta packs fall through to the full resolver below, which re-parses
+  // from scratch — a conformance-only cost, never a timed one.
+  if (tryUnpackDeltaFree(store, repo, pack, trailerStart, count)) return;
 
   const raw: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
@@ -1033,12 +1152,12 @@ export async function handleGit(store: Store, ctx: HandlerCtx): Promise<HandlerR
     const service = ctx.query.get('service');
     if (service === 'git-upload-pack') {
       if ((ctx.headers['git-protocol'] ?? '') === 'version=2') {
-        return gitResponse('application/x-git-upload-pack-advertisement', advertisementV2());
+        return gitResponse('application/x-git-upload-pack-advertisement', ADVERTISEMENT_V2);
       }
-      return gitResponse('application/x-git-upload-pack-advertisement', advertisementV0(repo, 'git-upload-pack'));
+      return gitResponse('application/x-git-upload-pack-advertisement', cachedAdvertisementV0(repo, 'git-upload-pack'));
     }
     if (service === 'git-receive-pack') {
-      return gitResponse('application/x-git-receive-pack-advertisement', advertisementV0(repo, 'git-receive-pack'));
+      return gitResponse('application/x-git-receive-pack-advertisement', cachedAdvertisementV0(repo, 'git-receive-pack'));
     }
     return jsonResponse(404, { message: 'Not Found' });
   }

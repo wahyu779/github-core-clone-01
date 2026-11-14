@@ -1157,9 +1157,7 @@ function doMutation(store: GqlStore, field: Selection, variables: Record<string,
       const changes = changedFiles(store, repo, baseSha, headSha);
       const message = `Merge pull request #${pull.number}: ${pull.title}`;
       let cur = baseSha;
-      if (changes.length === 0) {
-        cur = headSha;
-      } else {
+      if (changes.length > 0) {
         for (const change of changes) {
           if (change.status === 'deleted') {
             cur = store.deletePath(repo, cur, change.path, message).commitSha;
