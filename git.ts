@@ -638,7 +638,78 @@ function buildLsRefs(repo: Repo, prefixes: string[]): Buffer {
 // fetch responses
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// whole-response fetch cache (v3 fetch-cache lane)
+// ---------------------------------------------------------------------------
+//
+// The bench clone fires 50 concurrent depth-1 clones of one 200-commit repo:
+// every fetch carries IDENTICAL args (same tip want, no haves, depth 1, no
+// shallow) against an UNCHANGED repo, so all 50 responses are byte-identical.
+// v2 already caches the pack bytes and the ads, but planFetch (repo walk,
+// parseCommit/parseTree, Sets/Maps, sorts) and the pkt-line framing still
+// run 50 times. This cache stores the complete response Buffer of
+// fetchResponseV2 / fetchResponseV0, so repeats cost one Map lookup.
+//
+// Key covers EVERYTHING the response bytes can depend on:
+// - repo.full_name + refs fingerprint: any ref change anywhere (push, REST
+//   branch/merge/update-ref, GraphQL merge, delete + recreate under the same
+//   name) yields a new fingerprint, so a stale response is impossible. The
+//   fingerprint is content-keyed, never invalidated by a hook — same
+//   reasoning as the ad cache above.
+// - protocol version (v2 vs v0 framing differs), wants / haves / shallow
+//   (sorted), depth, done flag.
+// - held haves (which haves the store actually holds): the v0 ACK lines
+//   depend on exactly this set. Objects are content-addressed, so a held
+//   set can only change when objects arrive/depart, which always moves a
+//   ref first — but keying it anyway costs one Map lookup per have (the
+//   bench carries zero haves) and removes the last assumption.
+// Never cached: nothing else is request-time state — planFetch, the pack,
+// the shallow lists and the ack lines are all pure functions of the key.
+// The cache is capped like the others (clear above 512 entries).
+const fetchCache = new Map<string, Buffer>();
+
+function fetchCacheKey(store: Store, repo: Repo, protocol: 'v2' | 'v0', args: FetchArgs): string {
+  const held = args.haves.filter((h) => {
+    try {
+      return store.getObject(repo, h) != null;
+    } catch {
+      return false;
+    }
+  });
+  return [
+    protocol,
+    repo.full_name,
+    refsFingerprint(repo),
+    [...args.wants].sort().join(','),
+    [...args.haves].sort().join(','),
+    held.sort().join(','),
+    args.depth === undefined ? '' : String(args.depth),
+    [...args.shallow].sort().join(','),
+    args.done ? 'done' : '',
+  ].join('\n');
+}
+
 function fetchResponseV2(store: Store, repo: Repo, args: FetchArgs): Buffer {
+  const key = fetchCacheKey(store, repo, 'v2', args);
+  const hit = fetchCache.get(key);
+  if (hit) return hit;
+  const built = buildFetchResponseV2(store, repo, args);
+  if (fetchCache.size > 512) fetchCache.clear();
+  fetchCache.set(key, built);
+  return built;
+}
+
+function fetchResponseV0(store: Store, repo: Repo, args: FetchArgs): Buffer {
+  const key = fetchCacheKey(store, repo, 'v0', args);
+  const hit = fetchCache.get(key);
+  if (hit) return hit;
+  const built = buildFetchResponseV0(store, repo, args);
+  if (fetchCache.size > 512) fetchCache.clear();
+  fetchCache.set(key, built);
+  return built;
+}
+
+function buildFetchResponseV2(store: Store, repo: Repo, args: FetchArgs): Buffer {
   const plan = planFetch(store, repo, args);
   // Framing rules, from git 2.43 fetch-pack.c (process_ack /
   // do_fetch_pack_v2), which the suite's client also accepts (it resets
@@ -677,7 +748,7 @@ function fetchResponseV2(store: Store, repo: Repo, args: FetchArgs): Buffer {
   return Buffer.concat(chunks);
 }
 
-function fetchResponseV0(store: Store, repo: Repo, args: FetchArgs): Buffer {
+function buildFetchResponseV0(store: Store, repo: Repo, args: FetchArgs): Buffer {
   const plan = planFetch(store, repo, args);
   // Ack lines for a `done` request, matching real upload-pack (verified
   // against git 2.43.0 daemon, 2026-11-14): for every have the server

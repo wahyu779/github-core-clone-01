@@ -49,6 +49,25 @@ const OAUTH_SCOPES = 'repo, read:org';
 /** One shared empty body for every request that carries nothing. */
 const EMPTY_BODY = Buffer.alloc(0);
 
+/**
+ * One shared empty query for every request target with no '?'. No lane
+ * mutates ctx.query — a grep over all lanes shows only .get() reads plus
+ * `new URLSearchParams(ctx.query)` copies in rest.ts paginate() — so
+ * sharing one instance is safe. (Object.freeze is applied as well, but
+ * note it is belt-and-braces only: URLSearchParams keeps its entries in
+ * internal slots, so the real guarantee is the no-mutation grep above,
+ * not the freeze.)
+ */
+const EMPTY_QUERY: URLSearchParams = Object.freeze(new URLSearchParams()) as URLSearchParams;
+
+/** The bearer token this process accepts, or the local-only fallback.
+ * Read once at module load: the variable is set at process start and
+ * never changes, so looking it up per request was pure overhead. */
+const EXPECTED_TOKEN: string =
+  process.env.MAKEFUN_SHOP_TOKEN !== undefined && process.env.MAKEFUN_SHOP_TOKEN !== ''
+    ? process.env.MAKEFUN_SHOP_TOKEN
+    : 'test-token';
+
 /** Shared params object for routes that carry no git owner/repo. */
 const NO_PARAMS: Record<string, string> = {};
 
@@ -96,8 +115,7 @@ async function laneHandler(file: string, name: keyof LaneModule): Promise<LaneHa
 
 /** The bearer token this process accepts, or the local-only fallback. */
 function expectedToken(): string {
-  const fromEnv = process.env.MAKEFUN_SHOP_TOKEN;
-  return fromEnv !== undefined && fromEnv !== '' ? fromEnv : 'test-token';
+  return EXPECTED_TOKEN;
 }
 
 /**
@@ -128,14 +146,83 @@ function hasBody(req: IncomingMessage): boolean {
   return req.headers['transfer-encoding'] !== undefined;
 }
 
+/**
+ * The declared Content-Length, or null when there is none usable.
+ * Only a single, plain decimal header counts: chunked bodies carry no
+ * Content-Length, a repeated header is ambiguous, and a malformed value
+ * is not trusted — all three fall back to the old end-wait path below.
+ */
+function parseContentLength(req: IncomingMessage): number | null {
+  const raw = req.headers['content-length'];
+  if (raw === undefined || Array.isArray(raw)) return null;
+  if (!/^[0-9]+$/.test(raw)) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
+  const expected = parseContentLength(req);
+  // No usable Content-Length (chunked transfer-encoding, absent, or
+  // malformed): keep the old behaviour — wait for the 'end' event.
+  if (expected === null) {
+    return new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer | string) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      req.once('end', () => resolve(Buffer.concat(chunks)));
+      req.once('error', reject);
+    });
+  }
+  if (expected === 0) return Promise.resolve(EMPTY_BODY);
+  // Content-Length fast path (BODY-FAST lane): resolve the moment the
+  // declared number of bytes has arrived instead of waiting one more
+  // event-loop turn for 'end'. The small POST bodies in the bench
+  // (write workload, git push/fetch/ls-refs) arrive in a single chunk,
+  // so this skips the end-wait on every one of them. A body shorter
+  // than Content-Length never resolves early — only 'end' (or an
+  // error) settles it, exactly as before. Once resolved, the stream
+  // is resumed so its 'end' still fires on its own and the socket
+  // stays reusable for the next keep-alive request; a no-op error
+  // handler covers the window between resolve and 'end'.
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer | string) => {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    });
-    req.once('end', () => resolve(Buffer.concat(chunks)));
-    req.once('error', reject);
+    let received = 0;
+    let settled = false;
+    const onData = (chunk: Buffer | string): void => {
+      if (settled) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      chunks.push(buf);
+      received += buf.length;
+      if (received >= expected) {
+        settled = true;
+        cleanup();
+        req.once('error', () => {});
+        req.resume();
+        const body = Buffer.concat(chunks);
+        resolve(body.length === expected ? body : body.subarray(0, expected));
+      }
+    };
+    const onEnd = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(Buffer.concat(chunks));
+    };
+    const onError = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+    const cleanup = (): void => {
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+    };
+    req.on('data', onData);
+    req.once('end', onEnd);
+    req.once('error', onError);
   });
 }
 
@@ -148,7 +235,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 function splitTarget(req: IncomingMessage): { path: string; query: URLSearchParams } {
   const target = req.url ?? '/';
   const cut = target.indexOf('?');
-  if (cut === -1) return { path: target, query: new URLSearchParams() };
+  if (cut === -1) return { path: target, query: EMPTY_QUERY };
   return { path: target.slice(0, cut), query: new URLSearchParams(target.slice(cut + 1)) };
 }
 

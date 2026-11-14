@@ -41,7 +41,7 @@ function jsonReply(status: number, value: unknown, extraHeaders: Record<string, 
 }
 
 /** Same shape as jsonReply, but the body is already serialized JSON. */
-function jsonBodyReply(status: number, body: string, extraHeaders: Record<string, string> = {}): HandlerResponse {
+function jsonBodyReply(status: number, body: string | Buffer, extraHeaders: Record<string, string> = {}): HandlerResponse {
   return {
     status,
     headers: { 'x-github-request-id': nextRequestId(), ...extraHeaders },
@@ -58,6 +58,13 @@ function jsonBodyReply(status: number, body: string, extraHeaders: Record<string
 // (a WeakMap), so a deleted repo or a recreated issue can never serve
 // another issue's bytes, and the entry dies with the record.
 //
+// READ-FAST (v3): the body is cached as a Buffer, not a string, so the
+// per-read Buffer.from copy in app.ts sendResponse disappears — the
+// cached bytes go straight to res.end. The buffer is never mutated after
+// creation (sendResponse only reads .length and passes it to res.end),
+// and every rebuild allocates a fresh Buffer, so sharing one Buffer
+// across 2000 reads is safe.
+//
 // A hit is only served after re-checking every field the view exposes
 // (title, body, state, updated_at, comment count, each label's name/color)
 // against the snapshot stored with the body. That check is what makes the
@@ -70,7 +77,7 @@ function jsonBodyReply(status: number, body: string, extraHeaders: Record<string
 // visible field equal produces byte-identical JSON anyway.
 
 interface CachedIssueBody {
-  body: string;
+  body: Buffer;
   title: string;
   bodyText: string;
   state: string;
@@ -82,7 +89,7 @@ interface CachedIssueBody {
 
 const issueBodyCache = new WeakMap<Issue, CachedIssueBody>();
 
-function cachedIssueBody(issue: Issue): string {
+function cachedIssueBody(issue: Issue): Buffer {
   const hit = issueBodyCache.get(issue);
   if (
     hit !== undefined &&
@@ -103,7 +110,7 @@ function cachedIssueBody(issue: Issue): string {
     }
     if (labelsMatch) return hit.body;
   }
-  const body = JSON.stringify(issueView(issue));
+  const body = Buffer.from(JSON.stringify(issueView(issue)), 'utf8');
   issueBodyCache.set(issue, {
     body,
     title: issue.title,
@@ -148,20 +155,12 @@ function hasMalformedBody(ctx: HandlerCtx): boolean {
   return ctx.body !== undefined && ctx.body.length > 0 && ctx.json === undefined;
 }
 
-function checkAuth(ctx: HandlerCtx): HandlerResponse | null {
-  const token = ctx.token;
-  if (token === null || token === undefined || token === '') {
-    return errorReply(401, 'Authentication required');
-  }
-  const expected = process.env.MAKEFUN_SHOP_TOKEN;
-  if (expected !== undefined && expected !== '') {
-    if (token !== expected) return errorReply(401, 'Bad credentials');
-  } else if (token !== 'test-token') {
-    // No token configured (local runs only): the contract's literal stands in.
-    return errorReply(401, 'Bad credentials');
-  }
-  return null;
-}
+// NOTE (v3 read-fast): the old checkAuth lived here and re-verified the
+// bearer token on every REST request — an env lookup plus a compare that
+// app.ts had already done before dispatching (app.ts answers 401 itself
+// for a missing or wrong token, and handleRest is only ever called from
+// app.ts). It is gone; app.ts's own auth is untouched and is the only
+// auth check on this path.
 
 function decodeSegment(segment: string): string {
   try {
@@ -415,13 +414,67 @@ export function squashMergePullRequest(store: Store, repo: Repo, pull: PullReque
   return { ok: true, sha: mergeSha, message: mergeMessage };
 }
 
+/**
+ * Fast path for GET /api/v3/repos/{owner}/{repo}/issues/{number}.
+ * Returns the reply when the path is exactly that shape, or null to fall
+ * back to the full dispatch. Pure string ops: no split/filter/map, no
+ * decodeURIComponent unless a segment actually contains '%'.
+ */
+function fastIssueGet(store: Store, path: string): HandlerResponse | null {
+  // path starts with '/api/v3/repos/' (13 chars); the rest is owner/repo/issues/number.
+  const tail = path.slice(13);
+  const ownerEnd = tail.indexOf('/');
+  if (ownerEnd <= 0) return null;
+  const repoEnd = tail.indexOf('/', ownerEnd + 1);
+  if (repoEnd <= ownerEnd + 1) return null;
+  // The next 7 chars must be exactly 'issues/'.
+  if (tail.slice(repoEnd + 1, repoEnd + 8) !== 'issues/') return null;
+  const numberStart = repoEnd + 8;
+  // No further '/' allowed: anything after the number (e.g. /comments)
+  // belongs to the full dispatch.
+  if (tail.indexOf('/', numberStart) !== -1) return null;
+  const numberText = tail.slice(numberStart);
+  if (numberText === '') return null;
+  for (let i = 0; i < numberText.length; i += 1) {
+    const code = numberText.charCodeAt(i);
+    if (code < 48 || code > 57) return null;
+  }
+  const rawOwner = tail.slice(0, ownerEnd);
+  const rawRepo = tail.slice(ownerEnd + 1, repoEnd);
+  const owner = rawOwner.includes('%') ? decodeSegment(rawOwner) : rawOwner;
+  const repoName = rawRepo.includes('%') ? decodeSegment(rawRepo) : rawRepo;
+  const repo = store.getRepo(owner, repoName);
+  if (repo === undefined) return errorReply(404, 'Not Found');
+  const issue = repo.issues.get(Number.parseInt(numberText, 10));
+  if (issue === undefined) return errorReply(404, 'Not Found');
+  return jsonBodyReply(200, cachedIssueBody(issue));
+}
+
 // ------------------------------------------------------------------ handler
 
 export async function handleRest(store: Store, ctx: HandlerCtx): Promise<HandlerResponse> {
-  const auth = checkAuth(ctx);
-  if (auth !== null) return auth;
-
   const method = ctx.method.toUpperCase();
+
+  // READ-FAST (v3): fast path for GET /api/v3/repos/{owner}/{repo}/issues/{number}.
+  // The read bench hits exactly this shape 2000x in a row. The generic
+  // path below pays splitPath (split/filter/map + decodeURIComponent per
+  // segment), two slices and a long if-chain before it even reaches the
+  // issue lookup; this path does it with indexOf/slice only and no
+  // allocation beyond the two decoded segments (which are skipped
+  // entirely when they contain no '%'). Anything that is not exactly
+  // this shape — extra segments, a non-numeric number, an empty segment,
+  // a non-GET method — falls through to the full dispatch untouched, so
+  // every other route behaves byte-for-byte as before. The number must
+  // be all digits: parseInt("1abc") would be 1 in the full dispatch, so
+  // a non-digit number is left to the full dispatch rather than risking
+  // a different answer. Responses are built with the same helpers as the
+  // full dispatch (same 404 bodies, same jsonBodyReply + cached Buffer),
+  // so a fast-path reply is byte-identical to the full-dispatch reply.
+  if (method === 'GET' && ctx.path.startsWith('/api/v3/repos/')) {
+    const fast = fastIssueGet(store, ctx.path);
+    if (fast !== null) return fast;
+  }
+
   const parts = splitPath(ctx.path);
   // parts[0] === 'api', parts[1] === 'v3'; everything after is the route.
   const route = parts.slice(2);
